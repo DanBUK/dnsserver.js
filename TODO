@@ -1,0 +1,9 @@
+New storage system for storing records
+Ability to parse zonefiles
+Refactor / cleanup codebase
+Add all remaining query types
+Add support for compression
+Add support for TCP
+Add support for multiple questions
+Add proper error handling / reporting to client
+Add support for recursion?

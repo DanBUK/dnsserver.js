@@ -26,6 +26,8 @@ var sys = require('sys'),
 host = 'localhost';
 port = 9999;
 
+records = {};
+
 // slices a single byte into bits
 // assuming only single bytes
 var sliceBits = function(b, off, len) {
@@ -131,6 +133,8 @@ var processRequest = function(req) {
     query.question.qtype = req.slice(req.length - 4, req.length - 2);
     //qclass
     query.question.qclass = req.slice(req.length - 2, req.length);
+
+	// console.log(query);
     
     return query;
 };
@@ -140,7 +144,7 @@ var createResponse = function(query) {
     /*
     * Step 1: find record associated with query
     */
-    var results = findRecords(query.question.qname, 1);
+    var results = findRecords(query.question.qname, query.question.qtype);
 
     /*
     * Step 2: construct response object
@@ -228,7 +232,6 @@ var buildResponseBuffer = function(response) {
     response.header.id.copy(buf, 0, 0, 2);
     
     buf[2] = 0x00 | response.header.qr << 7 | response.header.opcode << 3 | response.header.aa << 2 | response.header.tc << 1 | response.header.rd;
-    
 
     buf[3] = 0x00 | response.header.ra << 7 | response.header.z << 4 | response.header.rcode;
 
@@ -252,7 +255,7 @@ var buildResponseBuffer = function(response) {
         //
         //create a new buffer to hold the request plus the rr
         //len of each response is 14 bytes of stuff + qname len 
-        var tmpBuf = getZeroBuf(buf.length + response.rr[i].qname.length + 14);
+        var tmpBuf = getZeroBuf(buf.length + response.rr[i].qname.length + 10 + response.rr[i].rdlength);
                 
         buf.copy(tmpBuf, 0, 0, buf.length);
 
@@ -262,9 +265,11 @@ var buildResponseBuffer = function(response) {
 
         numToBuffer(tmpBuf, rrStart+response.rr[i].qname.length+4, response.rr[i].ttl, 4);
         numToBuffer(tmpBuf, rrStart+response.rr[i].qname.length+8, response.rr[i].rdlength, 2);
-        numToBuffer(tmpBuf, rrStart+response.rr[i].qname.length+10, response.rr[i].rdata, response.rr[i].rdlength); // rdlength indicates rdata length
-        
-        rrStart = rrStart + response.rr[i].qname.length + 14;
+
+		// numToBuffer(tmpBuf, rrStart+response.rr[i].qname.length+10, response.rr[i].rdata, response.rr[i].rdlength); // rdlength indicates rdata length
+		response.rr[i].rdata.copy(tmpBuf, rrStart+response.rr[i].qname.length+10, 0, response.rr[i].rdlength);
+
+        rrStart = rrStart + response.rr[i].qname.length + 10 + response.rr[i].rdlength;
         
         buf = tmpBuf;
     }
@@ -306,7 +311,7 @@ var findRecords = function(qname, qtype, qclass) {
         throw new Error('Only internet class records supported');
     }
     
-    switch(qtype) {
+    switch(qtype.toString('binary').charCodeAt(1)) {
         case 1:
             qtype = 'a'; //a host address
             break;
@@ -338,7 +343,7 @@ var findRecords = function(qname, qtype, qclass) {
             qtype = 'null'; //a null RR (EXPERIMENTAL)
             break;
         case 11:
-            qtype = 'wks'; //a well known service description
+            qtype = 'wks'; //a well known service description (Deprecated in RFC 1123)
             break;
         case 12:
             qtype = 'ptr'; //a domain name pointer
@@ -355,24 +360,28 @@ var findRecords = function(qname, qtype, qclass) {
         case 16:
             qtype = 'txt'; //text strings
             break;
+		case 17:
+			qtype = 'rp'; // responsible party
+			break;
         case 255:
             qtype = '*'; //select all types
             break;
         default:
+			console.log("Didn't find: " + qtype);
             throw new Error('No valid type specified');
             break;
     }
 
     var domain = qnameToDomain(qname);        
     
-    //TODO add support for wildcard
     if (qtype === '*') {
-        throw new Error('Wildcard not support');
+		var rr = [];
+        for(var qtype in records[domain][qclass]) {
+			rr = rr.concat(records[domain][qclass][qtype]);
+		}
     } else {
         var rr = records[domain][qclass][qtype];
     }
-
-    
     
     return rr;
 };
@@ -401,34 +410,134 @@ server.addListener('error', function (e) {
   throw e;
 });
 
+//
+// Helper functions
+
+function ip2long(ip) {
+    var ipsegments = ip.split('.');
+	var iplong = 0;
+	for(i=0;i<4;i++) {
+		iplong += ipsegments[i] * Math.pow(256,3-i);
+	}
+	return iplong;
+}
+
+function createRecord(qname, qclass, qtype, ttl, rdata) {
+	rdlength = 0;
+	
+	if(typeof rdata == "number") {
+		rdlength = 4;
+	} else {
+		rdlength = rdata.length;
+	}
+	
+	return {
+		'qname': qname,
+		'qtype': qtype,
+		'qclass': qclass,
+		'ttl': ttl,
+		'rdlength': rdlength,
+		'rdata': rdata
+	};
+}
+
+function setupRecordTree(domain, type) {
+	if(!records[domain]) {
+		records[domain] = {};
+	}
+	if(!records[domain]['in']) {
+		records[domain]['in'] = {};
+	}
+	if(!records[domain]['in'][type]) {
+		records[domain]['in'][type] = [];
+	}
+	
+	return records[domain]['in'][type];
+}
+
+function addARecord(domain, ttl, data) {
+	var leaf = setupRecordTree(domain, 'a');
+	
+	var ip = ip2long(data);
+	
+	var rdata = getZeroBuf(4);
+	numToBuffer(rdata, 0, ip, 4);
+	
+	leaf.push(createRecord(domainToQname(domain), 1, 1, ttl, rdata));
+}
+
+function addHackARecord(domain, qdomain, ttl, data) {
+	var leaf = setupRecordTree(domain, 'a');
+	
+	var ip = ip2long(data);
+	
+	var rdata = getZeroBuf(4);
+	numToBuffer(rdata, 0, ip, 4);
+	
+	leaf.push(createRecord(domainToQname(qdomain), 1, 1, ttl, rdata));
+}
+
+function addSOARecord(domain, ttl, mname, rname, serial, refresh, retry, expire, minimum) {
+	var leaf = setupRecordTree(domain, 'soa');
+	
+	mname = domainToQname(mname);
+	rname = domainToQname(rname);
+	
+	var start = mname.length + rname.length;
+	var rdata = getZeroBuf(start + 4 + 4 + 4 + 4 + 4);
+	
+	mname.copy(rdata, 0, 0);
+	rname.copy(rdata, mname.length, 0);
+	
+	numToBuffer(rdata, start, serial, 4);
+	numToBuffer(rdata, start+4, refresh, 4);
+	numToBuffer(rdata, start+8, retry, 4);
+	numToBuffer(rdata, start+12, expire, 4);
+	numToBuffer(rdata, start+16, minimum, 4);
+	
+	leaf.push(createRecord(domainToQname(domain), 1, 6, ttl, rdata));
+	
+	// console.log(leaf);
+}
+
+function addMXRecord(domain, preference, host, ttl) {
+	var leaf = setupRecordTree(domain, 'mx');
+	
+	var qname = domainToQname(host);
+	
+	var rdata = getZeroBuf(2 + qname.length);
+	numToBuffer(rdata, 0, preference, 2);
+	qname.copy(rdata, 2, 0);
+	
+	leaf.push(createRecord(domainToQname(domain), 1, 15, ttl, rdata));
+}
+
+function addNSRecord(domain, host, ttl) {
+	var leaf = setupRecordTree(domain, 'ns');
+	
+	var rdata = domainToQname(host);
+	
+	leaf.push(createRecord(domainToQname(domain), 1, 2, ttl, rdata));
+}
+
+function addCNAMERecord(domain, host, ttl) {
+	var leaf = setupRecordTree(domain, 'cname');
+	
+	var rdata = domainToQname(host);
+	
+	leaf.push(createRecord(domainToQname(domain), 1, 5, ttl, rdata));
+}
 
 //
 //TODO create records database
 
-records = {};
-records['tomhughescroucher.com'] = {};
-records['tomhughescroucher.com']['in'] = {};
-records['tomhughescroucher.com']['in']['a'] = [];
-
-var r = {};
-r.qname = domainToQname('tomhughescroucher.com');
-r.qtype = 1;
-r.qclass = 1;
-r.ttl = 1;
-r.rdlength = 4;
-r.rdata = 0xBC8A0009;
-
-records['tomhughescroucher.com']['in']['a'].push(r);
-
-r = {};
-r.qname = domainToQname('tomhughescroucher.com');
-r.qtype = 1;
-r.qclass = 1;
-r.ttl = 1;
-r.rdlength = 4;
-r.rdata = 0x7F000001;
-
-records['tomhughescroucher.com']['in']['a'].push(r);
+addARecord('jeremyjohnstone.com', 300, "207.7.122.90");
+addHackARecord('jeremyjohnstone.com', 'www.jeremyjohnstone.com', 300, "207.7.122.90");
+addSOARecord('jeremyjohnstone.com', 86400, 'ns1.linode.com', 'domains.nsitechnologies.com', 2010071791, 14400, 14400, 1209600, 86400);
+addMXRecord('jeremyjohnstone.com', 33, "mail.jeremyjohnstone.com", 300);
+addNSRecord('jeremyjohnstone.com', "ns1.linode.com", 300);
+addNSRecord('jeremyjohnstone.com', "ns2.linode.com", 300);
+addCNAMERecord('jeremyjohnstone.com', "www.jeremyjohnstone.com", 300);
 
 server.bind(port, host);
 console.log('Started server on ' + host + ':' + port);
